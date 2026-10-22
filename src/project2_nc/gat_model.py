@@ -864,7 +864,10 @@ def run_project2(parts: pd.DataFrame, part_limit: int = 80, epochs: int = NC_SUR
         history=history,
         edge_metrics=report["edge_metrics"],
         param_metrics=report["param_metrics"],
-        region_table=report["region_table"].head(200),
+        # Every part is kept so the Streamlit panel can replay the forward pass
+        # for all of them and diff against this table row by row. Truncation is a
+        # display concern and belongs in the UI, not in the artifact.
+        region_table=report["region_table"],
         physics=report["physics"],
         graph_stats=corpus.stats,
         weights_path=str(weights_path),

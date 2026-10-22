@@ -20,6 +20,7 @@ import pandas as pd
 
 from src.common.data_valuation import run_valuation
 from src.config import (
+    CAUSAL_SEED,
     CHANNEL_LABELS,
     DATA_SOURCE_CATALOG,
     DEMO_DEFECT_LIMIT,
@@ -27,6 +28,7 @@ from src.config import (
     OUTPUT_DIR,
     RANDOM_SEED,
     SHAPLEY_BUDGET,
+    VALUATION_SEED,
 )
 from src.project1_governance.audit import build_rules, dimension_summary, rules_to_frame, run_audit
 from src.project1_governance.health import compute_health, copq_breakdown, fpy_rollup
@@ -120,7 +122,14 @@ def run(
           f"routes={len(routes.routes)}")
     _dump(routes.routes, out / "routes.parquet")
 
-    graph = build_graph(rng, corpus.defects.head(defect_limit))
+    # Stages 3b (causal CPTs) and 3c (Shapley sampling) both draw random numbers.
+    # Giving each its own seed -- instead of the shared pipeline rng -- is what lets
+    # the Streamlit panel rebuild the identical graph and re-price the identical
+    # pool on demand: the online copy no longer depends on how much rng the stages
+    # before it happened to consume. `run_meta.parquet` records the run it matches.
+    defect_cases = corpus.defects.head(defect_limit)
+    _dump(defect_cases, out / "defect_cases.parquet")
+    graph = build_graph(np.random.default_rng(CAUSAL_SEED), defect_cases)
     target = defect or graph.defect_nodes[0]
     attribution = infer(graph, target, top_k=5)
     print(f"  defect='{target}'  posterior mass of Top-5={attribution.posterior_sum:.3f}")
@@ -130,7 +139,18 @@ def run(
     cross = mechanism_cross_check(observed_load_delta=0.21, predicted_load_delta=0.19)
     print(f"  mechanism cross-check: {cross['verdict']} (rel_err={cross['relative_error']:.3f})")
 
-    valuation = run_valuation(routes.embedding, budget=SHAPLEY_BUDGET, rng=rng)
+    # Persist the mined latent codes so the online panel can re-run valuation for
+    # any budget without paying for PSO-Kmeans again.
+    _dump(
+        pd.DataFrame(
+            routes.embedding,
+            columns=[f"dim_{i:02d}" for i in range(routes.embedding.shape[1])],
+        ),
+        out / "route_embedding.parquet",
+    )
+
+    valuation = run_valuation(routes.embedding, budget=SHAPLEY_BUDGET,
+                              rng=np.random.default_rng(VALUATION_SEED))
     print(f"  data valuation: budget={valuation.budget}  selected={len(valuation.selected)}  "
           f"top discounted value={valuation.aggregated.max():.4f}")
     # shapley is only exact on the sampled sub-coalition; `values` is the surrogate's
@@ -164,6 +184,33 @@ def run(
     print(f"  param   {nc.param_metrics}")
     print(f"  physics {nc.physics}")
     _dump(nc.region_table, out / "nc_regions.parquet")
+
+    # -- manifest -----------------------------------------------------------
+    # The panel reads this to rebuild the causal graph and re-price the pool on
+    # the same footing as this run instead of guessing at its parameters.
+    _dump(
+        pd.DataFrame(
+            [
+                {
+                    "run_scale": "quick" if quick else ("full" if full else "demo"),
+                    "part_limit": part_limit,
+                    "defect_limit": defect_limit,
+                    "random_seed": RANDOM_SEED,
+                    "causal_seed": CAUSAL_SEED,
+                    "valuation_seed": VALUATION_SEED,
+                    "defect_mode": target,
+                    "gat_seed": RANDOM_SEED % 97,
+                    "gat_epochs": epochs if epochs is not None else 60 if quick else None,
+                    "gat_mode": nc.mode,
+                    "weights_path": nc.weights_path or "",
+                    "elapsed_s": round(time.time() - started, 1),
+                }
+            ]
+        ),
+        out / "run_meta.parquet",
+    )
+    print(f"  online-replay seeds: causal={CAUSAL_SEED} valuation={VALUATION_SEED} "
+          f"gat={RANDOM_SEED % 97} | part_limit={part_limit} defect_limit={defect_limit}")
 
     _banner(f"done in {time.time() - started:.1f}s")
     files = sorted(p.name for p in out.rglob("*.parquet"))

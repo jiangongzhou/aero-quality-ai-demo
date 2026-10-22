@@ -6,6 +6,10 @@ Reads the parquet files produced by ``run_all.py``. If they are missing the app
 says so instead of silently re-running the pipeline -- a browser is not the place
 to discover that a training run takes two minutes.
 
+The "⚡ 在线推理" page is the exception: it loads the cached GAT weights and the
+causal CPTs and runs a real forward pass per click. Every other page is a reader
+over ``outputs/*.parquet``; that one is the software.
+
 Every number shown here is computed from 100% synthetic data.
 """
 
@@ -13,12 +17,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.config import OUTPUT_DIR
+from src import live
+from src.config import NC_MERGE_THRESHOLD, OUTPUT_DIR, SHAPLEY_BUDGET
 
 st.set_page_config(
     page_title="航空结构件质量数据治理与 AI 数控编程",
@@ -344,7 +350,268 @@ def section_nc_model(frames: dict[str, pd.DataFrame]) -> None:
         )
     with c2:
         st.subheader("区域推荐参数（样例）")
-        st.dataframe(regions, width='stretch', hide_index=True, height=430)
+        st.caption(
+            f"全量 {len(regions)} 行 / {regions['零件号'].nunique()} 个零件，此处只展示前 200 行；"
+            "「⚡ 在线推理」页会重放全部零件的推理并逐行比对。"
+        )
+        st.dataframe(regions.head(200), width='stretch', hide_index=True, height=430)
+
+
+def _ready(name: str) -> bool:
+    return (OUTPUT_DIR / f"{name}.parquet").exists()
+
+
+@st.cache_resource(show_spinner="加载 GAT 权重并重建零件 B-rep 属性图 ...")
+def _gat_bundle():
+    return live.load_gat_bundle()
+
+
+@st.cache_resource(show_spinner="重建四层因果图 CPT ...")
+def _causal_bundle():
+    return live.load_causal_bundle()
+
+
+@st.cache_data(show_spinner=False)
+def _valuation_pool():
+    return live.load_valuation_pool()
+
+
+def _tab_gat() -> None:
+    st.subheader("① B-rep 属性图 → GAT 区域分割 → 切削参数回归")
+    st.markdown(
+        """
+点一次"执行"，下面这段前向传播就真的跑一遍：
+
+`面特征 (24-d)` → `节点编码器` → `3 层 × 4 头图注意力` → `边逻辑值（相邻两面是否同属一个加工区域）`
+→ `union-find 合并成加工区域` → `区域均值池化` → `参数头输出 (转速, 进给)` → `× SPINDLE_MAX/FEED_MAX 还原工艺单位`
+
+拖动**区域合并阈值**可以看到分割粒度怎么变：阈值调低，更多弱置信边被采信，区域被并成大片；
+调高则区域碎裂。这是模型输出的真实响应，不是预渲染的图。
+"""
+    )
+    bundle = _gat_bundle()
+    if bundle.mode == "untrained":
+        st.warning("未找到 GAT 权重缓存。请先运行 `python run_all.py`（首次会自动训练并缓存）。")
+        return
+
+    code = st.selectbox("零件号", bundle.part_codes, key="gat_part")
+    threshold = st.slider("区域合并阈值", 0.50, 0.99, float(NC_MERGE_THRESHOLD), 0.01, key="gat_thr")
+
+    pred = live.predict_part(bundle, code, merge_threshold=threshold)
+    m = live.summarise_prediction(pred)
+
+    row1 = st.columns(4)
+    row1[0].metric("边分类准确率", f"{m['边界准确率'] * 100:.2f}%")
+    row1[1].metric("区域 IoU", f"{m['区域IoU']:.4f}")
+    row1[2].metric("转速 MAPE", f"{m['转速MAPE'] * 100:.2f}%")
+    row1[3].metric("进给 MAPE", f"{m['进给MAPE'] * 100:.2f}%")
+
+    row2 = st.columns(4)
+    row2[0].metric("零件 面 / 边", f"{pred['n_faces']} / {pred['n_edges']}")
+    row2[1].metric("切分出加工区域", f"{int(m['预测区域数'])}")
+    row2[2].metric("边界精确率 / 召回率",
+                   f"{m['边界精确率']:.3f} / {m['边界召回率']:.3f}")
+    row2[3].metric("本次前向耗时", f"{m['推理耗时ms']:.1f} ms")
+
+    st.dataframe(pred["table"], width='stretch', hide_index=True,
+                 height=min(90 + 36 * len(pred["table"]), 460))
+
+    conf = pred["edge_confidence"]
+    fig = px.histogram(conf, nbins=40, labels={"value": "GAT 输出概率", "count": "边数量"},
+                       title=f"{code} · {len(conf)} 条候选边的分割置信度分布（阈值 {threshold:.2f}）",
+                       template=PLOT_THEME, color_discrete_sequence=[COLOR_AFTER])
+    fig.add_vline(x=threshold, line_dash="dash", line_color="#d62728",
+                  annotation_text="合并阈值", annotation_position="top")
+    fig.update_layout(height=330, margin=dict(l=10, r=10, t=45, b=10))
+    st.plotly_chart(fig, width='stretch')
+
+    with st.expander("🧪 一致性自检：在线重放 vs 离线 parquet", expanded=False):
+        regions = load("nc_regions")
+        if regions is None or "零件号" not in regions.columns:
+            st.info("缺少 nc_regions.parquet，无法比对。")
+        else:
+            shared = [c for c in bundle.part_codes if c in set(regions["零件号"])]
+            cols = ["预测转速", "预测进给"]
+            bad = []
+            for item in shared:
+                online = live.predict_part(bundle, item)["table"]
+                offline = regions[regions["零件号"] == item].reset_index(drop=True)
+                n = min(len(online), len(offline))
+                if n == 0:
+                    continue
+                if not np.allclose(online[cols].to_numpy(float)[:n],
+                                   offline[cols].to_numpy(float)[:n]):
+                    bad.append(item)
+            if not shared:
+                st.info("当前零件集合与离线表无交集。")
+            elif bad:
+                st.error(f"{len(bad)}/{len(shared)} 个零件与离线结果不一致：{bad[:5]}")
+            else:
+                st.success(
+                    f"在线重放的 {len(shared)} 个零件与 outputs/nc_regions.parquet 逐行一致；"
+                    f"其余 {len(bundle.part_codes) - len(shared)} 个零件属于训练/验证划分，"
+                    "离线表里本来就没有记录，已跳过。"
+                )
+
+
+def _tab_root_cause() -> None:
+    st.subheader("② 贝叶斯逆向推断：由缺陷模式反推关键工艺参数")
+    st.markdown(
+        """
+四层因果图 `工序 → 关键工艺参数(KPP) → 关键质量特性(KQC) → 缺陷模式` 已按记录的
+`causal_seed` 重建。每次改动下面任一滑杆都会重新做一次贝叶斯逆向推断
+`P(KPP | 缺陷) ∝ P(缺陷|KQC)^s · P(KQC) · P(KQC|KPP)`，其中 `s` 即证据强度。
+"""
+    )
+    if not _ready("defect_cases"):
+        st.info(
+            "缺少 defect_cases.parquet。请重新执行 `python run_all.py` —— "
+            "当前版本的流水线会落盘缺陷案例与运行元信息供本页复现。"
+        )
+        return
+
+    bundle = _causal_bundle()
+    defect = st.selectbox("缺陷模式", bundle.defect_modes, key="rc_defect")
+    strength = st.slider("证据强度 s（对似然做幂次锐化）", 0.5, 3.0, 1.0, 0.1, key="rc_str")
+    top_k = st.slider("Top-K 候选根因数", 3, 10, 5, 1, key="rc_k")
+
+    result, elapsed = live.diagnose(bundle, defect, evidence_strength=strength, top_k=top_k)
+
+    row = st.columns(4)
+    row[0].metric("Top-K 后验质量", f"{result.posterior_sum * 100:.2f}%")
+    row[1].metric("候选根因数", f"{len(result.candidates)}")
+    row[2].metric("本次推断耗时", f"{elapsed * 1000:.1f} ms")
+    row[3].metric("CPT 校准样本", f"{bundle.case_count}")
+
+    detail = result.candidates.copy()
+    detail["性价比排名"] = pct(detail["信息价值"]).rank(ascending=False).astype(int)
+    st.dataframe(detail, width='stretch', hide_index=True)
+
+    values = pct(result.candidates["后验概率"])
+    fig = px.bar(
+        x=values, y=result.candidates["候选根因"], orientation="h",
+        labels={"x": "后验概率(%)", "y": "候选根因"},
+        title=f"{defect} · 根因后验概率（证据强度 s={strength:.1f}）",
+        template=PLOT_THEME, color=values, color_continuous_scale="Blues",
+    )
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=40, b=10),
+                      yaxis=dict(autorange="reversed"))
+    st.plotly_chart(fig, width='stretch')
+
+    with st.expander("⚙️ 机理交叉校核（实测 vs 模型预测）", expanded=False):
+        observed = st.slider("实测切削负载增量", 0.05, 0.60, 0.21, 0.01, key="cc_obs")
+        predicted = st.slider("模型预测负载增量", 0.05, 0.60, 0.19, 0.01, key="cc_pred")
+        cross = live.cross_check(observed, predicted)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("相对误差", f"{cross['relative_error']:.3f}")
+        c2.metric("是否自洽", "通过" if cross["consistent"] else "不通过")
+        c3.metric("结论", str(cross["verdict"]))
+        st.caption(
+            "数据驱动的排序只说明「统计上可疑」，这一步用切削力学模型回答"
+            "「是否解释得通」：负载增量对不上，排序再高也不下发。"
+        )
+
+    with st.expander("🧪 一致性自检：在线重放 vs 离线 parquet", expanded=False):
+        offline = load("root_cause")
+        meta = live.load_meta()
+        if offline is None:
+            st.info("缺少 root_cause.parquet，无法比对。")
+        elif meta.get("defect_mode") != defect or abs(strength - 1.0) > 1e-9 or top_k != 5:
+            st.info(
+                "离线表是用 `defect_mode=%s`、证据强度 1.0、Top-5 生成的。"
+                "把上面三个控件调回该组合即可触发逐行比对。" % meta.get("defect_mode")
+            )
+        else:
+            online = result.candidates.reset_index(drop=True)
+            same = online.equals(offline.reset_index(drop=True))
+            if same:
+                st.success("在线推断结果与 outputs/root_cause.parquet 逐格一致。")
+            else:
+                st.error("在线推断结果与离线表不一致。")
+
+
+def _tab_valuation() -> None:
+    st.subheader("③ Shapley 估值 + 冗余折价：换预算重新定价整个数据池")
+    st.markdown(
+        """
+改预算后点"重新定价"，会完整重跑一遍
+`留一法(LOO) → Shapley 值 → 代理模型外推全池 → 冗余矩阵 → 折价贪心选择`，
+而不是在一张固定结果表里增删行。折价公式 `V = v_i · (1 − 0.35 · share_i)`，
+其中 `share_i` 是该样本对其最近邻的池内冗余占比。
+"""
+    )
+    if not _ready("route_embedding"):
+        st.info(
+            "缺少 route_embedding.parquet。请重新执行 `python run_all.py` —— "
+            "当前版本会把挖掘出的工艺路线隐向量落盘供本页复现。"
+        )
+        return
+
+    pool = _valuation_pool()
+    budget = st.slider("采购预算（入选样本数）", 10, 60, int(SHAPLEY_BUDGET), 5, key="val_budget")
+    st.caption(
+        f"数据池 {len(pool):,} 条 × {pool.shape[1]} 维隐向量。"
+        "滑杆上限收到 60，因为贪心选择是 O(预算 × 池规模)，再往上单次要点几十秒，不适合网页交互。"
+    )
+
+    if st.button("▶ 重新定价整个数据池", type="primary", key="val_run"):
+        with st.spinner("LOO → Shapley → 代理模型 → 冗余折价贪心选择 ..."):
+            result, elapsed = live.price_pool(pool, budget)
+        frame = live.valuation_frame(result)
+        # `result` travels along so the redundancy table below can reuse the
+        # pricing we just paid for instead of re-running the whole greedy pass.
+        st.session_state["valuation_live"] = (frame, result.aggregation_trace, elapsed, result)
+    else:
+        st.info("点上面的按钮跑一次定价。默认预算与离线流水线一致（40）。")
+
+    cached = st.session_state.get("valuation_live")
+    if cached is None:
+        return
+
+    frame, trace, elapsed, result = cached
+    row = st.columns(4)
+    row[0].metric("预算 / 入选", f"{budget} / {int(frame['是否入选'].sum())}")
+    row[1].metric("选中集合折价后价值", f"{trace['aggregated_selected']:.4f}")
+    row[2].metric("全池折价后价值", f"{trace['aggregated_all']:.4f}")
+    row[3].metric("本次定价耗时", f"{elapsed:.2f} s")
+
+    st.caption(
+        f"基线效用 {trace['baseline_utility']} · 代理模型终损 {trace['surrogate_final_loss']} · "
+        f"平均样本价值 {trace['mean_sample_value']} · "
+        f"平均两两冗余 {trace['mean_pairwise_redundancy']} · 平均冗余占比 {trace['mean_redundancy_share']}"
+    )
+
+    fig = go.Figure()
+    fig.add_scatter(x=frame["样本编号"], y=frame["Shapley值"], mode="markers",
+                    name="原始 Shapley 值", marker=dict(size=5, color=COLOR_BEFORE))
+    fig.add_scatter(x=frame["样本编号"], y=frame["冗余折价后价值"], mode="markers",
+                    name="冗余折价后价值", marker=dict(size=5, color=COLOR_AFTER))
+    fig.update_layout(title="冗余剔除前后的样本价值", template=PLOT_THEME, height=400,
+                      xaxis_title="样本编号", yaxis_title="价值",
+                      margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig, width='stretch')
+
+    st.dataframe(frame[frame["是否入选"]].sort_values("冗余折价后价值", ascending=False),
+                 width='stretch', hide_index=True, height=340)
+
+    with st.expander("🔗 冗余样本对（选中集合内部）", expanded=False):
+        st.dataframe(live.valuation_report(result, pool),
+                     width='stretch', hide_index=True)
+
+
+def section_live() -> None:
+    st.header("⚡ 在线推理 · 现场调用算法")
+    st.caption(
+        "其余页面读的是 `run_all.py` 预先算好的 parquet；这一页不是。"
+        "下面的每个数字都是你改动控件那一刻，由缓存的 GAT 权重与因果 CPT 现算出来的。"
+    )
+    tab1, tab2, tab3 = st.tabs(["🎯 GAT 实时推理", "🔍 贝叶斯根因诊断", "💰 估值预算寻优"])
+    with tab1:
+        _tab_gat()
+    with tab2:
+        _tab_root_cause()
+    with tab3:
+        _tab_valuation()
 
 
 def section_pipeline() -> None:
@@ -408,6 +675,7 @@ def main() -> None:
         "⑥ 根因归因": lambda: section_root_cause(frames),
         "⑦ 数据估值": lambda: section_valuation(frames),
         "🎯 AI 数控编程": lambda: section_nc_model(frames),
+        "⚡ 在线推理": lambda: section_live(),
         "系统架构": lambda: section_pipeline(),
     }
     choice = st.sidebar.radio("页面", list(pages), label_visibility="collapsed")

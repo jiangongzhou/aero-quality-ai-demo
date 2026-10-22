@@ -132,6 +132,13 @@ DEMO_DEFECT_LIMIT = 150       # defect cases fed to the causal graph
 QUICK_PART_LIMIT = 24
 QUICK_DEFECT_LIMIT = 60
 
+# The online inference panel recomputes results on the fly, so the two stages
+# that draw random numbers must not depend on how much of the shared pipeline
+# rng happened to be consumed before they ran. Pinning them to their own seeds
+# makes `streamlit` reproduce the offline parquet bit for bit.
+CAUSAL_SEED = 20240419        # root-cause CPT Dirichlet draws
+VALUATION_SEED = 31415        # Shapley coalition sampling + surrogate init
+
 NC_PART_CATEGORIES = ["腹板类", "框类", "梁类", "接头类", "肋类", "壁板类"]
 
 # workpiece materials drive the cutting envelope, so the parameter head has to
