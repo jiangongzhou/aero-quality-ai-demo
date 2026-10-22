@@ -152,6 +152,8 @@ def run(
     nc_kwargs = {"part_limit": part_limit, "train": train, "seed": RANDOM_SEED % 97}
     if epochs is not None:
         nc_kwargs["epochs"] = epochs
+    elif quick:
+        nc_kwargs["epochs"] = 60
     nc = run_project2(corpus.parts, **nc_kwargs)
     print(f"  mode={nc.mode}  weights={nc.weights_path or 'in-memory'}")
     print(f"  graphs={int(nc.graph_stats['parts'])}  "
